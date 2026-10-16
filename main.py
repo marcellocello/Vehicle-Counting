@@ -1,73 +1,84 @@
-import cv2
-import torch
-from ultralytics import solutions
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from typing import Set
+import asyncio
 
-points = []
-MODEL_TYPE = "yolo11s.pt"
-VIDEO_PATH = "./sample2.mp4"
-region_points = [
-    (150, 350),
-    (1100, 350),
-    (1300, 600),
-    (0, 600)
-]
-classes_allowed = [2, 3, 5, 7]
+from counting import VehicleCounting
 
-def mouse_callback(event, x, y, flags, param):
-    if event == cv2.EVENT_LBUTTONDOWN:
-        points.append((x, y))
-        print(f"Titik len{points}: ({x}, {y})")
+app = FastAPI()
 
-        if len(points) == 2:
-            print(f"\nGaris selesai: x1={points[0][0]}, y1={points[0][1]}, x2={points[1][0]}, y2={points[1][1]}")
+class SubscriptionManager():
+    def __init__(self):
+        self.subscribers: Set[WebSocket] = set()
 
-def select_device():
-    if torch.cuda.is_available():
-        device = "cuda"
-    elif torch.backends.mps.is_available():
-        device = "mps"
-    else:
-        device = "cpu"
+    async def connect(self, websocket: WebSocket):
+        await websocket.accept()
 
-    print(f"Running on device: {device.upper()}")
-    return device
+    def subscribe(self, websocket: WebSocket):
+        self.subscribers.add(websocket)
 
-def vehicle_counting():
-    device = select_device()
-    cap = cv2.VideoCapture(VIDEO_PATH)
-    assert cap.isOpened(), "Error reading video file"
+    def unsubscribe(self, websocket: WebSocket):
+        self.subscribers.discard(websocket)
 
-    w, h, fps = (int(cap.get(x)) for x in (cv2.CAP_PROP_FRAME_WIDTH, cv2.CAP_PROP_FRAME_HEIGHT, cv2.CAP_PROP_FPS))
-    video_writer = cv2.VideoWriter("object_counting_output.avi", cv2.VideoWriter_fourcc(*"mp4v"), fps, (w, h))
+    async def broadcast_to_subscribers(self, data: dict):
+        for connection in self.subscribers:
+            try:
+                await connection.send_json(data)
+            except Exception:
+                self.subscribers.discard(connection)
 
-    counter = solutions.ObjectCounter(
-        show=True,
-        show_conf=False,
-        show_labels=False,
-        region=region_points,
-        model=MODEL_TYPE,
-        classes=classes_allowed,
-        show_out=True,
-        show_in=True,
-        line_width=2,
-        device=device
-    )
+manager = SubscriptionManager()
 
-    cv2.namedWindow("Vehicle Counting")
-    cv2.setMouseCallback("Vehicle Counting", mouse_callback)
+@app.on_event("startup")
+async def start_vehicle_counter_stream():
+    detector = VehicleCounting(show_window=False)
 
-    while cap.isOpened():
-        success, frame = cap.read()
-        if not success:
-            break
+    async def stream_loop():
+        last_counts = {}
+        while True:
+            if not manager.subscribers:
+                await asyncio.sleep(0.5)
+                continue
 
-        results = counter(frame)
-        print(results.classwise_count)
-        video_writer.write(results.plot_im)
+            counts = await asyncio.to_thread(detector.process_next_frame)
 
-    cap.release()
-    video_writer.release()
-    cv2.destroyAllWindows()
+            if counts and counts != last_counts:
+                last_counts = dict(counts)
+                await manager.broadcast_to_subscribers(
+                    {
+                        "event": "vehicle_counted",
+                        "data": counts
+                    }
+                )
 
-if __name__ == "__main__":
-    vehicle_counting()
+            await asyncio.sleep(0.001)
+
+    asyncio.create_task(stream_loop())
+
+@app.websocket("/ws")
+async def websocket_endpoint(websocket: WebSocket):
+    await manager.connect(websocket)
+    try:
+        while True:
+            payload = await websocket.receive_json()
+            action = payload.get("action")
+
+            if action == "subscribe":
+                manager.subscribe(websocket)
+                await websocket.send_json(
+                    {
+                        "status": "SUCCESS",
+                        "message": "Berhasil subscribe ke vehicle counting"
+                    }
+                )
+                print("FE berhasil subscribe!")
+            elif action == "unsubscribe":
+                manager.unsubscribe(websocket)
+                await websocket.send_json(
+                    {
+                        "status": "SUCCESS",
+                        "message": "Berhenti subscribe."
+                    }
+                )
+                print("FE unsubscribe!")
+    except WebSocketDisconnect:
+        manager.unsubscribe(websocket)
